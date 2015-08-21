@@ -68,7 +68,7 @@ from py2neo.packages.jsonstream import assembled
 from py2neo.ext.spatial.exceptions import (
     AddNodeToLayerError, GeometryExistsError, GeometryNotFoundError,
     InvalidWKTError, LayerExistsError, LayerNotFoundError, NodeNotFoundError,
-    ValidationError)
+    NoResultsError, ValidationError)
 from py2neo.ext.spatial.util import parse_lat_long_to_point
 
 
@@ -99,6 +99,10 @@ class Spatial(ServerPlugin):
     def __init__(self, graph):
         super(Spatial, self).__init__(graph, EXTENSION_NAME)
 
+    def _assemble(self, json_stream):
+        nodes = map(Node.hydrate, assembled(json_stream))
+        return nodes
+
     def _handle_post_from_resource(self, resource, spatial_payload):
         try:
             json_stream = resource.post(spatial_payload)
@@ -107,15 +111,10 @@ class Spatial(ServerPlugin):
                 # no results leads to a NullPointerException.
                 # this is probably a bug on the Java side, but this
                 # happens with some resources and must be managed.
-                return []
+                raise NoResultsError
             raise
 
-        if json_stream.status_code == 204:
-            # no content
-            return []
-
-        nodes = map(Node.hydrate, assembled(json_stream))
-        return nodes
+        return json_stream
 
     def _get_shape_from_wkt(self, wkt_string):
         try:
@@ -155,8 +154,7 @@ class Spatial(ServerPlugin):
                 The name to give the Layer created. Must be unique.
 
         :Returns:
-            The Layer Node containing the configuration for the newly created
-            Layer.
+            An HTTP status code.
 
         :Raises:
             LayerExistsError
@@ -172,45 +170,16 @@ class Spatial(ServerPlugin):
 
         spatial_data = dict(layer=layer_name, **EXTENSION_CONFIG)
         raw = resource.post(spatial_data)
-        layer = assembled(raw)
 
-        return layer
-
-    def get_layer(self, layer_name):
-        """ Get the Layer identified by `layer_name`.
-
-        :Parameters:
-            layer_name : str
-                The name of the Layer to return.
-
-        :Returns:
-            The Layer Node.
-
-        :Raises:
-            LayerNotFoundError
-                If a Layer with `layer_name` does not exist.
-
-        """
-        resource = self.resources['getLayer']
-
-        spatial_data = dict(layer=layer_name, **EXTENSION_CONFIG)
-        nodes = self._handle_post_from_resource(resource, spatial_data)
-
-        try:
-            layer_node = nodes[0]
-        except IndexError:
-            raise LayerNotFoundError(
-                'Layer Not Found: "{}"'.format(layer_name)
-            )
-
-        return layer_node
+        return raw.status_code
 
     def delete_layer(self, layer_name):
         """ Delete a GIS map Layer.
 
         This will remove a representation of a GIS map Layer from the Neo4j
         data store - it will not remove any nodes you may have added to it, or
-        any labels or properties py2neo Spatial may have added to your Nodes.
+        any labels or properties py2neo Spatial may have added to your own
+        Nodes.
 
         :Parameters:
             layer_name : str
@@ -220,15 +189,20 @@ class Spatial(ServerPlugin):
             None
 
         :Raises:
-            LayerNotFoundError if the Layer does not exist.
+            LayerNotFoundError
+                When the Layer to delete does not exist.
+
+        .. note::
+            The return type here is `None` and not an HTTP status because
+            there is no Neo4j Spatial Extension REST endpoint for deleting a
+            layer, so we use the Py2neo cypher API, which returns nothing on
+            delete.
 
         """
         if not self._layer_exists(layer_name):
             raise LayerNotFoundError(
                 'Layer Not Found: "{}"'.format(layer_name)
             )
-
-        graph = self.graph
 
         # remove the bounding box, metadata and root from the rtree index
         query = (
@@ -244,11 +218,60 @@ class Spatial(ServerPlugin):
             'layer_name': layer_name
         }
 
-        graph.cypher.execute(query, params)
+        self.graph.cypher.execute(query, params)
+
+    def get_layer(self, layer_name, assembled=True):
+        """ Get the Layer identified by `layer_name`.
+
+        :Parameters:
+            layer_name : str
+                The name of the Layer to return.
+            assembled : bool
+                bool flag to switch the return value between an assembled
+                :class:`py2neo.Node` instance or the raw JSON representation.
+                Defauults to `True`, meaning an actual Node instance is
+                returned.
+
+        :Returns:
+            The Layer Node when `assembled` is `True`, else the JSON
+            serialised Layer Node.
+
+        :Raises:
+            LayerNotFoundError
+                If a Layer with `layer_name` does not exist.
+
+        """
+        resource = self.resources['getLayer']
+
+        spatial_data = dict(layer=layer_name, **EXTENSION_CONFIG)
+
+        try:
+            raw = self._handle_post_from_resource(resource, spatial_data)
+        except NoResultsError:
+            raise LayerNotFoundError(
+                'Layer Not Found: "{}"'.format(layer_name)
+                )
+
+        if assembled:
+            nodes = self._assemble(raw)
+
+            try:
+                layer_node = nodes[0]
+            except IndexError:
+                raise LayerNotFoundError(
+                    'Layer Not Found: "{}"'.format(layer_name)
+                )
+
+            return layer_node
+
+        json_node_list = raw.content
+        layer_node = json_node_list[0]
+
+        return layer_node
 
     def add_node_to_layer_by_id(
             self, node_id, layer_name, geometry_name, wkt_string, labels=None):
-        """ Add a non-geographically aware Node to a Layer (spatial index) by
+        """ Add a non-geographically aware Node to a Layer (a spatial index) by
         it's internal ID. This is any Node without a WKT property, as defined
         by the extensions `WKT_PROPERTY` value.
 
@@ -265,7 +288,7 @@ class Spatial(ServerPlugin):
                 An optional list of labels to give to the Node.
 
         :Returns:
-            The updated Node identified by `node_id`.
+            An HTTP status code.
 
         :Raises:
             NodeNotFoundError
@@ -308,14 +331,14 @@ class Spatial(ServerPlugin):
             'layer': layer_name
         }
 
-        nodes = self._handle_post_from_resource(resource, spatial_data)
-        node = nodes[0]
+        raw = self._handle_post_from_resource(resource, spatial_data)
+        status_code = raw.status_code
 
-        return node
+        return status_code
 
     def create_point_of_interest(
-            self, poi_name, layer_name, longitude, latitude, labels=None,
-            **node_properties):
+            self, poi_name, layer_name, longitude, latitude,
+            labels=None, node_properties=None):
         """ Create a Point of Interest (POI) on a Layer.
 
         :Parameters:
@@ -335,7 +358,7 @@ class Spatial(ServerPlugin):
                 Optional keyword arguments to apply as properties on the Node.
 
         :Returns:
-            The geometry Node created.
+            An HTTP status_code.
 
         :Raises:
             LayerNotFoundError
@@ -363,6 +386,8 @@ class Spatial(ServerPlugin):
         graph = self.graph
 
         labels = labels or []
+        node_properties = node_properties or {}
+
         labels.extend([DEFAULT_LABEL, layer_name, shape.type])
         wkt = dumps(shape, rounding_precision=4)
 
@@ -381,18 +406,20 @@ class Spatial(ServerPlugin):
             'layer': layer_name
         }
 
-        resp = resource.post(spatial_data)
-        if resp.status_code != 200:
+        raw = resource.post(spatial_data)
+        status_code = raw.status_code
+
+        if status_code != 200:
             raise AddNodeToLayerError(
                 'Failed to add POI "{}" to layer "{}"'.format(
                     poi_name, layer_name)
             )
 
-        return node
+        return status_code
 
     def create_geometry(
-            self, geometry_name, layer_name, wkt_string, labels=None,
-            **node_properties):
+            self, geometry_name, layer_name, wkt_string,
+            labels=None, node_properties=None):
         """ Create a geometry Node with any WKT string type.
 
         :Parameters:
@@ -408,7 +435,7 @@ class Spatial(ServerPlugin):
                 Optional keyword arguments to apply as properties on the Node.
 
         :Returns:
-            The geometry Node created.
+            An HTTP status code.
 
         :Raises:
             LayerNotFoundError
@@ -437,6 +464,8 @@ class Spatial(ServerPlugin):
             )
 
         labels = labels or []
+        node_properties = node_properties or {}
+
         labels.extend([DEFAULT_LABEL, layer_name, shape.type])
 
         spatial_data = {
@@ -445,10 +474,15 @@ class Spatial(ServerPlugin):
         }
 
         resp = resource.post(spatial_data)
+        status_code = resp.status_code
+        if status_code != 200:
+            return status_code
+
         content = resp.content[0]
         node_id = content['metadata']['id']
 
         # update the geometry node with provided node properties and labels
+        # manually as the upstream API does not except extra args in tbis case
         query = (
             "MATCH geometry_node WHERE id(geometry_node) = {node_id} "
             "RETURN geometry_node"
@@ -471,7 +505,7 @@ class Spatial(ServerPlugin):
         node.labels.update(set(labels))
         node.push()
 
-        return node
+        return status_code
 
     def update_geometry(self, layer_name, geometry_name, new_wkt_string):
         """ Update the WKT geometry on a Node.
@@ -486,7 +520,7 @@ class Spatial(ServerPlugin):
                 existing on the Node with `geometry_name`.
 
         :Returns:
-            The updaed Node.
+            An HTTP status code.
 
         :Raises:
             GeometryNotFoundError
@@ -538,10 +572,9 @@ class Spatial(ServerPlugin):
         }
 
         # update the geometry node
-        nodes = self._handle_post_from_resource(resource, spatial_data)
-        node = nodes[0]
+        raw = self._handle_post_from_resource(resource, spatial_data)
 
-        return node
+        return raw.status_code
 
     def delete_geometry(self, layer_name, geometry_name):
         """ Remove a geometry Node from a Layer.
@@ -562,6 +595,12 @@ class Spatial(ServerPlugin):
         :Raises:
             LayerNotFoundError
                 When the Layer does not exist.
+
+        .. note::
+            The return type here is `None` and not an HTTP status because
+            there is no Neo4j Spatial Extension REST endpoint for deleting a
+            layer, so we use the Py2neo cypher API, which returns nothing on
+            delete.
 
         """
         if not self._layer_exists(layer_name):
@@ -585,7 +624,8 @@ class Spatial(ServerPlugin):
 
         self.graph.cypher.execute(query, params)
 
-    def find_within_distance(self, layer_name, longitude, latitude, distance):
+    def find_within_distance(
+            self, layer_name, longitude, latitude, distance, assembled=True):
         """ Find all WKT geometry primitive within a given distance from
         location coord.
 
@@ -600,9 +640,15 @@ class Spatial(ServerPlugin):
                 equator.
             distance : int
                 The radius of the search area in Kilometres (km).
+            assembled : bool
+                Flag to switch the return value between an assembled list of
+                :class:`py2neo.Node` instances or a list of the raw JSON
+                representations.
+                Defaults to `True`, meaning actual Node instances are returned.
 
         :Returns:
-            A list of all matched nodes.
+            A list of all matched nodes or JSON serialised nodes when
+            `assembled` is `False`.
 
         :Raises:
             LayerNotFoundError
@@ -625,11 +671,16 @@ class Spatial(ServerPlugin):
             'distanceInKm': distance,
         }
 
-        nodes = self._handle_post_from_resource(resource, spatial_data)
+        raw = self._handle_post_from_resource(resource, spatial_data)
+        if assembled:
+            nodes = self._assemble(raw)
+            return nodes
 
-        return nodes
+        serialised_nodes = raw.content
+        return serialised_nodes
 
-    def find_within_bounding_box(self, layer_name, minx, miny, maxx, maxy):
+    def find_within_bounding_box(
+            self, layer_name, minx, miny, maxx, maxy, assembled=True):
         """ Find the points of interest from a given layer enclosed by a
         bounding box.
 
@@ -649,9 +700,15 @@ class Spatial(ServerPlugin):
                 Longitude of the top-right corner.
             minx : Decimal
                 Latitude of the top-right corner.
+            assembled : bool
+                Flag to switch the return value between an assembled list of
+                :class:`py2neo.Node` instances or a list of the raw JSON
+                representations.
+                Defaults to `True`, meaning actual Node instances are returned.
 
         :Returns:
-            A list of all matched nodes in order of distance.
+            A list of all matched nodes or JSON serialised nodes when
+            `assembled` is `False`.
 
         """
         resource = self.resources['findGeometriesInBBox']
@@ -664,11 +721,16 @@ class Spatial(ServerPlugin):
             'maxy': maxy,
         }
 
-        nodes = self._handle_post_from_resource(resource, spatial_data)
+        raw = self._handle_post_from_resource(resource, spatial_data)
+        if assembled:
+            nodes = self._assemble(raw)
+            return nodes
 
-        return nodes
+        serialised_nodes = raw.content
+        return serialised_nodes
 
-    def find_containing_geometries(self, layer_name, longitude, latitude):
+    def find_containing_geometries(
+            self, layer_name, longitude, latitude, assembled=True):
         """ Given the position of a point of interest, find all the geometries
         that contain it on a given Layer.
 
@@ -681,9 +743,15 @@ class Spatial(ServerPlugin):
             latitude : Decimal
                 Decimal number between -90.0 and 90.0, north or south of the
                 equator.
+            assembled : bool
+                Flag to switch the return value between an assembled list of
+                :class:`py2neo.Node` instances or a list of the raw JSON
+                representations.
+                Defaults to `True`, meaning actual Node instances are returned.
 
         :Returns:
-            A list of Nodes of geometry type Polygon or MultiPolygon.
+            A list of all matched nodes or JSON serialised nodes when
+            `assembled` is `False`.
 
         """
         resource = self.resources['findGeometriesWithinDistance']
@@ -696,18 +764,17 @@ class Spatial(ServerPlugin):
             'distanceInKm': 0,  # set this to zero to ensure POI is contained
         }
 
-        nodes = self._handle_post_from_resource(resource, spatial_data)
+        raw = self._handle_post_from_resource(resource, spatial_data)
+        if assembled:
+            nodes = self._assemble(raw)
+            return nodes
 
-        # exclude any Points or LineString geometries etc we may have collected
-        polygon_nodes = [
-            node for node in nodes if
-            MULTIPOLYGON in node.labels or POLYGON in node.labels
-        ]
-
-        return polygon_nodes
+        serialised_nodes = raw.content
+        return serialised_nodes
 
     def find_points_of_interest(
-            self, layer_name, longitude, latitude, max_distance, labels):
+            self, layer_name, longitude, latitude, max_distance, labels,
+            assembled=True):
         """ Given a coordinate, find the Point geometries that are "nearby" it
         and are "interesting". Only Nodes that have matching `labels` are
         deemed "interesting".
@@ -726,9 +793,15 @@ class Spatial(ServerPlugin):
             labels : list
                 List of node labels which determine which points are
                 "interesting".
+            assembled : bool
+                Flag to switch the return value between an assembled list of
+                :class:`py2neo.Node` instances or a list of the raw JSON
+                representations.
+                Defaults to `True`, meaning actual Node instances are returned.
 
         :Returns:
-            A list of interesting Nodes.
+            A list of all matched nodes or JSON serialised nodes when
+            `assembled` is `False`.
 
         """
         resource = self.resources['findGeometriesWithinDistance']
@@ -752,10 +825,21 @@ class Spatial(ServerPlugin):
             'distanceInKm': max_distance,
         }
 
-        nodes = self._handle_post_from_resource(resource, spatial_data)
+        raw = self._handle_post_from_resource(resource, spatial_data)
+        if assembled:
+            nodes = self._assemble(raw)
+
+            interesting_nodes = [
+                node for node in nodes if
+                interesting_labels.intersection(node.labels)
+            ]
+
+            return interesting_nodes
+
+        serialised_nodes = raw.content
         interesting_nodes = [
-            node for node in nodes if
-            interesting_labels.intersection(node.labels)
+            node for node in serialised_nodes if
+            interesting_labels.intersection(set(node['metadata']['labels']))
         ]
 
         return interesting_nodes

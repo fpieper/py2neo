@@ -87,6 +87,28 @@ class TestQueries(TestBase):
             [poi.get_properties()[NAME_PROPERTY] for poi in pois])
         assert expected_features == actual_features
 
+    def test_find_within_bounding_box_serialised(
+            self, spatial, uk, london_features, uk_features, towns):
+
+        assert len(london_features) == 4
+
+        self.load_points_of_interest(spatial, london_features, "uk")
+        self.load_points_of_interest(spatial, uk_features, "uk")
+        self.load_points_of_interest(spatial, towns, "uk")
+
+        london = (51.236220, -0.570409, 51.703000, 0.244)
+        min_latitude, min_longitude, max_latitude, max_longitude = london
+        serialised_nodes = spatial.find_within_bounding_box(
+            "uk", min_longitude, min_latitude, max_longitude, max_latitude,
+            assembled=False)
+
+        assert len(serialised_nodes) == len(london_features)
+
+        expected_features = sorted([f.name for f in london_features])
+        actual_features = sorted(
+            [node['data'][NAME_PROPERTY] for node in serialised_nodes])
+        assert expected_features == actual_features
+
     def test_finds_multi_geometry_types_within_distance(
             self, spatial, counties, london_features):
 
@@ -119,6 +141,48 @@ class TestQueries(TestBase):
 
         county_names = [
             county_node.properties['geometry_name']
+            for county_node in counties
+        ]
+
+        assert sorted(expected_counties) == sorted(county_names)
+
+    def test_find_within_distance_serialised(
+            self, spatial, counties, london_features):
+
+        self.load_points_of_interest(spatial, london_features, "uk")
+
+        # somewhere in North London, again
+        longitude = -0.07937
+        latitude = 51.559676
+
+        # this should only return london features
+        serialised_nodes = spatial.find_within_distance(
+            layer_name="uk",
+            longitude=longitude,
+            latitude=latitude,
+            distance=35,
+            assembled=False,
+        )
+
+        points_of_interest = [
+            node for node in serialised_nodes
+            if 'Point' in node['metadata']['labels']
+        ]
+
+        counties = [
+            node for node in serialised_nodes
+            if 'MultiPolygon' in node['metadata']['labels']
+        ]
+
+        assert len(points_of_interest) + len(counties) == len(serialised_nodes)
+        assert len(points_of_interest) == len(london_features)
+
+        expected_counties = [
+            'london', 'surrey', 'buckinghamshire', 'essex', 'kent'
+        ]
+
+        county_names = [
+            county_node['data']['geometry_name']
             for county_node in counties
         ]
 
@@ -159,6 +223,24 @@ class TestQueries(TestBase):
             layer_name="uk", longitude=longitude, latitude=latitude)
 
         assert len(geometries) == 2  # includes england now
+
+    def test_find_containing_geometries_serialised(
+            self, spatial, counties, england):
+
+        guildford = (51.236220, -0.570409)
+
+        serialised_nodes = spatial.find_containing_geometries(
+            layer_name="uk", longitude=guildford[1], latitude=guildford[0],
+            assembled=False)
+
+        assert len(serialised_nodes) == 2  # includes england now
+
+        expected_geometries = ['surrey', 'england']
+        actual_names = [
+            node['data'][NAME_PROPERTY] for node in serialised_nodes
+        ]
+
+        assert sorted(expected_geometries) == sorted(actual_names)
 
     def test_find_points_of_interest_missing_layer(self, spatial):
         # somewhere in North London
@@ -211,3 +293,35 @@ class TestQueries(TestBase):
             max_distance=max_distance, labels=['favourite'])
 
         assert len(geometries) == 1
+
+    def test_find_points_of_interest_serialised(
+            self, spatial, uk, london_features):
+
+        assert len(london_features) == 4
+
+        # somewhere in North London
+        longitude = -0.07937
+        latitude = 51.559676
+        max_distance = 50
+
+        favourite_london_feature = london_features.pop()
+
+        self.load_points_of_interest(
+            spatial, [favourite_london_feature], "uk",
+            labels=['london', 'favourite'])
+        self.load_points_of_interest(
+            spatial, london_features, "uk", labels=['london'])
+
+        serialised_nodes = spatial.find_points_of_interest(
+            layer_name="uk", longitude=longitude, latitude=latitude,
+            max_distance=max_distance, labels=['london'],
+            assembled=False)
+
+        assert len(serialised_nodes) == 4
+
+        serialised_nodes = spatial.find_points_of_interest(
+            layer_name="uk", longitude=longitude, latitude=latitude,
+            max_distance=max_distance, labels=['favourite'],
+            assembled=False)
+
+        assert len(serialised_nodes) == 1

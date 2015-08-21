@@ -33,7 +33,9 @@ class TestLayers(TestBase):
                 layer_name=LAYER_NAME)
 
     def test_get_layer(self, spatial):
-        spatial.create_layer("this")
+        status_code = spatial.create_layer("this")
+
+        assert status_code == 200
         assert self._layer_exists(spatial.graph, "this")
         assert spatial.get_layer("this")
 
@@ -91,3 +93,7 @@ class TestLayers(TestBase):
 
         with pytest.raises(LayerNotFoundError):
             spatial.get_layer(layer_name)
+
+    def test_get_serialised_layer(self, spatial, uk):
+        serialised_layer = spatial.get_layer("uk", assembled=False)
+        assert serialised_layer['data']['layer'] == "uk"

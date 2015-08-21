@@ -46,3 +46,7 @@ class AddNodeToLayerError(Exception):
 
 class ValidationError(Exception):
     pass
+
+
+class NoResultsError(Exception):
+    pass
